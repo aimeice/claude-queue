@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# claude-queue - Automated GitHub issue solver & creator
+# claude-queue - Automated Linear issue solver & creator
 #
 # Commands:
 #   claude-queue [options]         Solve open issues (default)
 #   claude-queue create [options]  Create issues from text or interactively
 #
 # Solve options:
-#   --issue ID         Solve specific issue(s) by ID, URL, or comma-separated IDs
+#   --team TEAM        Linear team key (e.g. ENG) or set LINEAR_TEAM_ID env var
+#   --issue ID         Solve specific issue(s) by ID (e.g. ENG-123) or comma-separated
 #   --max-retries N    Max retries per issue (default: 3)
 #   --max-turns N      Max Claude turns per attempt (default: 50)
 #   --label LABEL      Only process issues with this label (can be repeated)
@@ -16,6 +17,7 @@
 #   -h, --help         Show this help message
 #
 # Create options:
+#   --team TEAM        Linear team key (e.g. ENG) or set LINEAR_TEAM_ID env var
 #   -i, --interactive  Interview mode (Claude asks questions)
 #   --label LABEL      Add this label to all created issues
 #   --model MODEL      Claude model to use
@@ -30,14 +32,11 @@ MAX_TURNS=50
 declare -a ISSUE_FILTERS=()
 ISSUE_IDS=""
 MODEL_FLAG=""
+LINEAR_TEAM="${LINEAR_TEAM_ID:-}"
 DATE=$(date +%Y-%m-%d)
 TIMESTAMP=$(date +%H%M%S)
 BRANCH="claude-queue/${DATE}"
 LOG_DIR="/tmp/claude-queue-${DATE}-${TIMESTAMP}"
-
-LABEL_PROGRESS="claude-queue:in-progress"
-LABEL_SOLVED="claude-queue:solved"
-LABEL_FAILED="claude-queue:failed"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -55,14 +54,15 @@ CHILD_PID=""
 START_TIME=$(date +%s)
 
 show_help() {
-    echo "claude-queue v${VERSION} — Automated GitHub issue solver & creator"
+    echo "claude-queue v${VERSION} — Automated Linear issue solver & creator"
     echo ""
     echo "Usage:"
     echo "  claude-queue [options]              Solve open issues (default)"
     echo "  claude-queue create [options] [text] Create issues from text or interactively"
     echo ""
     echo "Solve options:"
-    echo "  --issue ID         Solve specific issue(s) by ID, URL, or comma-separated IDs"
+    echo "  --team TEAM        Linear team key (e.g. ENG) or set LINEAR_TEAM_ID env var"
+    echo "  --issue ID         Solve specific issue(s) by Linear ID (e.g. ENG-123), comma-separated"
     echo "  --max-retries N    Max retries per issue (default: 3)"
     echo "  --max-turns N      Max Claude turns per attempt (default: 50)"
     echo "  --label LABEL      Only process issues with this label (can be repeated)"
@@ -74,7 +74,7 @@ show_help() {
 }
 
 show_create_help() {
-    echo "claude-queue create — Generate GitHub issues from text or an interactive interview"
+    echo "claude-queue create — Generate Linear issues from text or an interactive interview"
     echo ""
     echo "Usage:"
     echo "  claude-queue create \"description\"     Create issues from inline text"
@@ -82,6 +82,7 @@ show_create_help() {
     echo "  claude-queue create -i                 Interactive interview mode"
     echo ""
     echo "Options:"
+    echo "  --team TEAM        Linear team key (e.g. ENG) or set LINEAR_TEAM_ID env var"
     echo "  -i, --interactive  Interview mode (Claude asks clarifying questions first)"
     echo "  --label LABEL      Add this label to every created issue"
     echo "  --model MODEL      Claude model to use"
@@ -98,9 +99,8 @@ cleanup() {
     local exit_code=$?
 
     if [ -n "$CURRENT_ISSUE" ]; then
-        log_warn "Interrupted while working on issue #${CURRENT_ISSUE}"
-        gh issue edit "$CURRENT_ISSUE" --remove-label "$LABEL_PROGRESS" 2>/dev/null || true
-        gh issue edit "$CURRENT_ISSUE" --add-label "$LABEL_FAILED" 2>/dev/null || true
+        log_warn "Interrupted while working on issue ${CURRENT_ISSUE}"
+        linear issue update "$CURRENT_ISSUE" -s "Backlog" 2>/dev/null || true
     fi
 
     if [ $exit_code -ne 0 ] && [ ${#SOLVED_ISSUES[@]} -gt 0 ]; then
@@ -130,7 +130,7 @@ preflight() {
 
     local failed=false
 
-    for cmd in gh claude git jq; do
+    for cmd in linear gh claude git jq; do
         if command -v "$cmd" &>/dev/null; then
             log "  $cmd ... found"
         else
@@ -139,11 +139,26 @@ preflight() {
         fi
     done
 
+    if ! linear team list &>/dev/null; then
+        log_error "  linear auth ... not authenticated (run 'linear auth login')"
+        failed=true
+    else
+        log "  linear auth ... ok"
+    fi
+
     if ! gh auth status &>/dev/null; then
-        log_error "  gh auth ... not authenticated"
+        log_error "  gh auth ... not authenticated (needed for PR creation)"
         failed=true
     else
         log "  gh auth ... ok"
+    fi
+
+    if [ -z "$LINEAR_TEAM" ]; then
+        log_error "  linear team ... not set (use --team FLAG or LINEAR_TEAM_ID env var)"
+        failed=true
+    else
+        export LINEAR_TEAM_ID="$LINEAR_TEAM"
+        log "  linear team ... ${LINEAR_TEAM}"
     fi
 
     if ! git rev-parse --is-inside-work-tree &>/dev/null; then
@@ -170,11 +185,8 @@ preflight() {
 }
 
 ensure_labels() {
-    log "Creating labels (if missing)..."
-
-    gh label create "$LABEL_PROGRESS" --color "fbca04" --description "claude-queue is working on this"  --force 2>/dev/null || true
-    gh label create "$LABEL_SOLVED"   --color "0e8a16" --description "Solved by claude-queue"           --force 2>/dev/null || true
-    gh label create "$LABEL_FAILED"   --color "d93f0b" --description "claude-queue could not solve this" --force 2>/dev/null || true
+    # No-op: Linear uses workflow states (Todo/In Progress/Done/Backlog) instead of labels
+    true
 }
 
 setup_branch() {
@@ -196,27 +208,27 @@ setup_branch() {
 }
 
 fetch_issues() {
-    local args=(--state open --json "number,title,body,labels" --limit 200 --search "sort:created-asc")
+    local args=(issue list -s "Todo" --json)
 
     for filter in "${ISSUE_FILTERS[@]}"; do
         args+=(--label "$filter")
     done
 
-    gh issue list "${args[@]}"
+    linear "${args[@]}" 2>/dev/null
 }
 
-parse_issue_number() {
+parse_issue_id() {
     local input="$1"
 
-    local num
-    num=$(echo "$input" | grep -oE '[0-9]+$' || echo "")
+    local id
+    id=$(echo "$input" | grep -oE '[A-Z]+-[0-9]+' || echo "")
 
-    if [ -z "$num" ]; then
-        log_error "Invalid issue identifier: $input"
+    if [ -z "$id" ]; then
+        log_error "Invalid issue identifier: $input (expected format like ENG-123)"
         return 1
     fi
 
-    echo "$num"
+    echo "$id"
 }
 
 fetch_specific_issues() {
@@ -228,14 +240,14 @@ fetch_specific_issues() {
     for id in "${id_array[@]}"; do
         id=$(echo "$id" | xargs)
 
-        local num
-        if ! num=$(parse_issue_number "$id"); then
+        local issue_id
+        if ! issue_id=$(parse_issue_id "$id"); then
             continue
         fi
 
         local issue_json
-        issue_json=$(gh issue view "$num" --json "number,title,body,labels" 2>/dev/null) || {
-            log_error "Could not fetch issue #${num}"
+        issue_json=$(linear issue view "$issue_id" --json 2>/dev/null) || {
+            log_error "Could not fetch issue ${issue_id}"
             continue
         }
 
@@ -252,26 +264,22 @@ fetch_specific_issues() {
 }
 
 process_issue() {
-    local issue_number=$1
+    local issue_id=$1
     local issue_title="$2"
     local attempt=0
     local solved=false
-    local issue_log="${LOG_DIR}/issue-${issue_number}.md"
+    local issue_log="${LOG_DIR}/issue-${issue_id}.md"
     local checkpoint
     checkpoint=$(git rev-parse HEAD)
 
-    CURRENT_ISSUE="$issue_number"
+    CURRENT_ISSUE="$issue_id"
 
-    log_header "Issue #${issue_number}: ${issue_title}"
+    log_header "Issue ${issue_id}: ${issue_title}"
 
-    gh issue edit "$issue_number" \
-        --remove-label "$LABEL_SOLVED" \
-        --remove-label "$LABEL_FAILED" \
-        2>/dev/null || true
-    gh issue edit "$issue_number" --add-label "$LABEL_PROGRESS"
+    linear issue update "$issue_id" -s "In Progress" 2>/dev/null || true
 
     {
-        echo "# Issue #${issue_number}: ${issue_title}"
+        echo "# Issue ${issue_id}: ${issue_title}"
         echo ""
         echo "**Started:** $(date)"
         echo ""
@@ -296,10 +304,10 @@ $(cat .claude-queue)"
         fi
 
         local prompt
-        prompt="You are an automated assistant solving a GitHub issue in this repository.
+        prompt="You are an automated assistant solving a Linear issue in this repository.
 
 First, read the full issue details by running:
-  gh issue view ${issue_number}
+  linear issue view ${issue_id}
 
 Then:
 1. Explore the codebase to understand the project structure and conventions
@@ -320,7 +328,7 @@ followed by an explanation of what needs to be done instead.
 Otherwise, when you are done, output a line that says CLAUDE_QUEUE_SUMMARY followed by a 2-3 sentence
 description of what you changed and why."
 
-        local attempt_log="${LOG_DIR}/issue-${issue_number}-attempt-${attempt}.log"
+        local attempt_log="${LOG_DIR}/issue-${issue_id}-attempt-${attempt}.log"
         local claude_exit=0
 
         # shellcheck disable=SC2086
@@ -351,7 +359,7 @@ description of what you changed and why."
                 echo ""
             } >> "$issue_log"
             solved=true
-            log_success "Issue #${issue_number} handled (no code changes needed)"
+            log_success "Issue ${issue_id} handled (no code changes needed)"
             break
         fi
 
@@ -383,17 +391,15 @@ description of what you changed and why."
         } >> "$issue_log"
 
         git add -A
-        git commit -m "fix: resolve #${issue_number} - ${issue_title}
+        git commit -m "fix: resolve ${issue_id} - ${issue_title}
 
 Automated fix by claude-queue.
-Closes #${issue_number}" --quiet
+Resolves ${issue_id}" --quiet
 
         solved=true
 
-        log_success "Solved issue #${issue_number} on attempt ${attempt}"
+        log_success "Solved issue ${issue_id} on attempt ${attempt}"
     done
-
-    gh issue edit "$issue_number" --remove-label "$LABEL_PROGRESS" 2>/dev/null || true
 
     {
         echo "**Finished:** $(date)"
@@ -401,13 +407,13 @@ Closes #${issue_number}" --quiet
     } >> "$issue_log"
 
     if [ "$solved" = true ]; then
-        gh issue edit "$issue_number" --add-label "$LABEL_SOLVED"
-        gh issue comment "$issue_number" --body-file "$issue_log" 2>/dev/null || true
-        SOLVED_ISSUES+=("${issue_number}|${issue_title}")
+        linear issue update "$issue_id" -s "Done" 2>/dev/null || true
+        linear issue comment add "$issue_id" --body "$(cat "$issue_log")" 2>/dev/null || true
+        SOLVED_ISSUES+=("${issue_id}|${issue_title}")
     else
-        gh issue edit "$issue_number" --add-label "$LABEL_FAILED"
-        gh issue comment "$issue_number" --body "claude-queue failed to solve this issue after ${MAX_RETRIES} attempts." 2>/dev/null || true
-        FAILED_ISSUES+=("${issue_number}|${issue_title}")
+        linear issue update "$issue_id" -s "Backlog" 2>/dev/null || true
+        linear issue comment add "$issue_id" --body "claude-queue failed to solve this issue after ${MAX_RETRIES} attempts." 2>/dev/null || true
+        FAILED_ISSUES+=("${issue_id}|${issue_title}")
         git reset --hard "$checkpoint" --quiet 2>/dev/null || true
         git clean -fd --quiet 2>/dev/null || true
     fi
@@ -494,9 +500,9 @@ create_pr() {
             echo "| Issue | Title |"
             echo "|-------|-------|"
             for entry in "${SOLVED_ISSUES[@]}"; do
-                local num="${entry%%|*}"
+                local id="${entry%%|*}"
                 local title="${entry#*|}"
-                echo "| #${num} | ${title} |"
+                echo "| ${id} | ${title} |"
             done
             echo ""
         fi
@@ -507,9 +513,9 @@ create_pr() {
             echo "| Issue | Title |"
             echo "|-------|-------|"
             for entry in "${FAILED_ISSUES[@]}"; do
-                local num="${entry%%|*}"
+                local id="${entry%%|*}"
                 local title="${entry#*|}"
-                echo "| #${num} | ${title} |"
+                echo "| ${id} | ${title} |"
             done
             echo ""
         fi
@@ -524,11 +530,11 @@ create_pr() {
                 continue
             fi
 
-            local issue_num
-            issue_num=$(basename "$log_file" | grep -oE '[0-9]+')
+            local issue_id
+            issue_id=$(basename "$log_file" .md | sed 's/^issue-//')
 
             echo "<details>"
-            echo "<summary>Issue #${issue_num} Log</summary>"
+            echo "<summary>Issue ${issue_id} Log</summary>"
             echo ""
             head -c 40000 "$log_file"
             echo ""
@@ -573,7 +579,7 @@ main() {
     echo '  \___|_|\__,_|\__,_|\__,_|\___|      \__, |\__,_|\___|\__,_|\___|'
     echo '                                         |_|                      '
     echo -e "${NC}"
-    echo -e "  ${DIM}Automated GitHub issue solver${NC}"
+    echo -e "  ${DIM}Automated Linear issue solver${NC}"
     echo ""
 
     preflight
@@ -600,18 +606,11 @@ main() {
     log "Found ${total} open issue(s)"
 
     for i in $(seq 0 $((total - 1))); do
-        local number title labels
-        number=$(echo "$issues" | jq -r ".[$i].number")
+        local identifier title
+        identifier=$(echo "$issues" | jq -r ".[$i].identifier")
         title=$(echo "$issues" | jq -r ".[$i].title")
-        labels=$(echo "$issues" | jq -r "[.[$i].labels[].name] | join(\",\")" 2>/dev/null || echo "")
 
-        if [ -z "$ISSUE_IDS" ] && echo "$labels" | grep -q "claude-queue:"; then
-            log "Skipping #${number} (already has a claude-queue label)"
-            SKIPPED_ISSUES+=("${number}|${title}")
-            continue
-        fi
-
-        process_issue "$number" "$title" || true
+        process_issue "$identifier" "$title" || true
     done
 
     if [ ${#SOLVED_ISSUES[@]} -gt 0 ]; then
@@ -640,7 +639,7 @@ create_preflight() {
 
     local failed=false
 
-    for cmd in gh claude jq; do
+    for cmd in linear claude jq; do
         if command -v "$cmd" &>/dev/null; then
             log "  $cmd ... found"
         else
@@ -649,18 +648,19 @@ create_preflight() {
         fi
     done
 
-    if ! gh auth status &>/dev/null; then
-        log_error "  gh auth ... not authenticated"
+    if ! linear team list &>/dev/null; then
+        log_error "  linear auth ... not authenticated (run 'linear auth login')"
         failed=true
     else
-        log "  gh auth ... ok"
+        log "  linear auth ... ok"
     fi
 
-    if ! git rev-parse --is-inside-work-tree &>/dev/null; then
-        log_error "  git repo ... not inside a git repository"
+    if [ -z "$LINEAR_TEAM" ]; then
+        log_error "  linear team ... not set (use --team FLAG or LINEAR_TEAM_ID env var)"
         failed=true
     else
-        log "  git repo ... ok"
+        export LINEAR_TEAM_ID="$LINEAR_TEAM"
+        log "  linear team ... ${LINEAR_TEAM}"
     fi
 
     if [ "$failed" = true ]; then
@@ -669,8 +669,8 @@ create_preflight() {
     fi
 }
 
-get_repo_labels() {
-    gh label list --json name -q '.[].name' 2>/dev/null | paste -sd ',' -
+get_team_labels() {
+    linear issue list --json 2>/dev/null | jq -r '[.[].labels[]?.name] | unique | join(",")' 2>/dev/null || echo ""
 }
 
 extract_json() {
@@ -698,29 +698,29 @@ extract_json() {
 
 create_from_text() {
     local user_text="$1"
-    local repo_labels
-    repo_labels=$(get_repo_labels)
+    local team_labels
+    team_labels=$(get_team_labels)
 
     log "Analyzing text and generating issues..."
 
     local prompt
-    prompt="You are a GitHub issue planner. The user wants to create issues for a repository.
+    prompt="You are a Linear issue planner. The user wants to create issues for a project.
 
-Existing labels in the repo: ${repo_labels}
+Existing labels in the team: ${team_labels}
 
 The user's description:
 ${user_text}
 
-Decompose this into a JSON array of well-structured GitHub issues. Each issue should have:
+Decompose this into a JSON array of well-structured Linear issues. Each issue should have:
 - \"title\": a clear, concise issue title
-- \"body\": a detailed issue body in markdown (include acceptance criteria where appropriate)
-- \"labels\": an array of label strings (reuse existing repo labels when they fit, or suggest new ones)
+- \"description\": a detailed issue description in markdown (include acceptance criteria where appropriate)
+- \"labels\": an array of label strings (reuse existing team labels when they fit, or suggest new ones)
 
 Rules:
 - Create separate issues for logically distinct tasks
 - Each issue should be independently actionable
 - Use clear, imperative titles (e.g. \"Add dark mode toggle to settings page\")
-- If the description is vague, make reasonable assumptions and note them in the body
+- If the description is vague, make reasonable assumptions and note them in the description
 
 Output ONLY the JSON array, no other text."
 
@@ -747,15 +747,15 @@ Output ONLY the JSON array, no other text."
 }
 
 create_interactive() {
-    local repo_labels
-    repo_labels=$(get_repo_labels)
+    local team_labels
+    team_labels=$(get_team_labels)
     local conversation=""
     local max_turns=10
     local turn=0
 
-    local system_prompt="You are a GitHub issue planner conducting an interview to understand what issues to create for a repository.
+    local system_prompt="You are a Linear issue planner conducting an interview to understand what issues to create for a project.
 
-Existing labels in the repo: ${repo_labels}
+Existing labels in the team: ${team_labels}
 
 Your job:
 1. Ask focused questions to understand what the user wants to build or fix
@@ -764,8 +764,8 @@ Your job:
 
 Each issue in the JSON array should have:
 - \"title\": a clear, concise issue title
-- \"body\": a detailed issue body in markdown
-- \"labels\": an array of label strings (reuse existing repo labels when they fit)
+- \"description\": a detailed issue description in markdown
+- \"labels\": an array of label strings (reuse existing team labels when they fit)
 
 Rules:
 - Ask one question at a time
@@ -895,16 +895,16 @@ preview_issues() {
     echo ""
 
     for i in $(seq 0 $((count - 1))); do
-        local title labels body
+        local title labels desc
         title=$(echo "$json" | jq -r ".[$i].title")
         labels=$(echo "$json" | jq -r ".[$i].labels // [] | join(\", \")")
-        body=$(echo "$json" | jq -r ".[$i].body" | head -3)
+        desc=$(echo "$json" | jq -r ".[$i].description" | head -3)
 
         echo -e "  ${BOLD}$((i + 1)). ${title}${NC}"
         if [ -n "$labels" ]; then
             echo -e "     ${DIM}Labels: ${labels}${NC}"
         fi
-        echo -e "     ${DIM}$(echo "$body" | head -1)${NC}"
+        echo -e "     ${DIM}$(echo "$desc" | head -1)${NC}"
         echo ""
     done
 }
@@ -926,9 +926,9 @@ confirm_and_create() {
     echo ""
 
     for i in $(seq 0 $((count - 1))); do
-        local title body
+        local title desc
         title=$(echo "$json" | jq -r ".[$i].title")
-        body=$(echo "$json" | jq -r ".[$i].body")
+        desc=$(echo "$json" | jq -r ".[$i].description")
 
         local label_args=()
         local issue_labels
@@ -943,9 +943,9 @@ confirm_and_create() {
             label_args+=(--label "$extra_label")
         fi
 
-        local issue_url
-        issue_url=$(gh issue create --title "$title" --body "$body" "${label_args[@]}" 2>&1)
-        log_success "Created: ${issue_url}"
+        local issue_output
+        issue_output=$(linear issue create -t "$title" -d "$desc" "${label_args[@]}" 2>&1)
+        log_success "Created: ${issue_output}"
     done
 
     echo ""
@@ -960,6 +960,7 @@ cmd_create() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             -i|--interactive) interactive=true; shift ;;
+            --team)           LINEAR_TEAM="$2"; shift 2 ;;
             --label)          extra_label="$2"; shift 2 ;;
             --model)          MODEL_FLAG="--model $2"; shift 2 ;;
             -h|--help)        show_create_help; exit 0 ;;
@@ -977,7 +978,7 @@ cmd_create() {
     elif [ -n "$user_text" ]; then
         json=$(create_from_text "$user_text")
     else
-        echo -e "${BOLD}Describe what issues you want to create.${NC}"
+        echo -e "${BOLD}Describe what Linear issues you want to create.${NC}"
         echo -e "${DIM}Type or paste your text, then press Ctrl+D when done.${NC}"
         echo ""
         user_text=$(cat)
@@ -1003,6 +1004,7 @@ case "$SUBCOMMAND" in
     "")
         while [[ $# -gt 0 ]]; do
             case $1 in
+                --team)        LINEAR_TEAM="$2"; shift 2 ;;
                 --issue)       ISSUE_IDS="$2"; shift 2 ;;
                 --max-retries) MAX_RETRIES="$2"; shift 2 ;;
                 --max-turns)   MAX_TURNS="$2";   shift 2 ;;
